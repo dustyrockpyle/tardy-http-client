@@ -18,6 +18,7 @@ pub fn build(b: *std.Build) void {
     thc.addImport("tardy", tardy);
 
     add_example(b, "multi_fetch", target, optimize, thc);
+    add_example(b, "basic", target, optimize, thc);
 }
 
 fn add_example(
@@ -50,6 +51,9 @@ fn add_example(
     build_step.dependOn(&install_artifact.step);
 
     const run_artifact = b.addRunArtifact(example);
+    if (b.args) |args| {
+        run_artifact.addArgs(args);
+    }
     run_artifact.step.dependOn(&install_artifact.step);
 
     const run_step = b.step(b.fmt("run_{s}", .{name}), b.fmt("Run thc example ({s})", .{name}));
