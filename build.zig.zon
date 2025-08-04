@@ -1,0 +1,20 @@
+.{
+    .name = .tardy_http_client,
+    .fingerprint = 0xb6eeb177d1ff778a,
+    .version = "0.0.0",
+    .minimum_zig_version = "0.14.1",
+    .dependencies = .{
+        .tardy = .{
+            .url = "git+https://github.com/tardy-org/tardy#e934f66f417a8edcd044f09180caaef5d229998e",
+            .hash = "tardy-0.3.0-69wrggDqAwBrbvkG9J-DXzCTwvA4o6_Q6cSI7_jTGYSk",
+        },
+    },
+
+    .paths = .{
+        "README.md",
+        "LICENSE",
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}
