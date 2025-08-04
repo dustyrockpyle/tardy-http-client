@@ -1419,7 +1419,7 @@ pub const ConnectUnixError = Allocator.Error || std.posix.SocketError || error{N
 /// Connect to `path` as a unix domain socket. This will reuse a connection if one is already open.
 ///
 /// This function is threadsafe.
-pub fn connectUnix(rt: *tardy.Runtime, client: *Client, path: []const u8) ConnectUnixError!*Connection {
+pub fn connectUnix(rt: *tardy.Runtime, client: *Client, path: []const u8) !*Connection {
     if (client.connection_pool.findConnection(.{
         .host = path,
         .port = 0,

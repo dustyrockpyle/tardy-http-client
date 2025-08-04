@@ -19,6 +19,21 @@ pub fn build(b: *std.Build) void {
 
     add_example(b, "multi_fetch", target, optimize, thc);
     add_example(b, "basic", target, optimize, thc);
+
+    const test_runner = std.Build.Step.Compile.TestRunner{ .path = b.path("test_runner.zig"), .mode = .simple };
+    const tests = b.addTest(.{
+        .name = "all_tests",
+        .root_source_file = b.path("./src/tests.zig"),
+        .optimize = optimize,
+        .test_runner = test_runner,
+    });
+    tests.root_module.addImport("tardy", tardy);
+
+    const test_artifact = b.addRunArtifact(tests);
+    test_artifact.step.dependOn(&tests.step);
+
+    const test_step = b.step("test", "Run tests");
+    test_step.dependOn(&test_artifact.step);
 }
 
 fn add_example(
