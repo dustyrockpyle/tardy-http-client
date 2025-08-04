@@ -20,6 +20,9 @@ const proto = std.http.protocol;
 pub const disable_tls = std.options.http_disable_tls;
 pub const tardy = @import("tardy");
 pub const Stream = @import("Stream.zig");
+pub const Future = @import("future.zig").Future;
+
+const FETCH_STACK_SIZE: usize = 2 << 20; // 2 MiB stack size for each client task (seems like a lot, but 1 MiB crashes for HTTPS endpoints...).
 
 /// Used for all client allocations. Must be thread-safe.
 allocator: Allocator,
@@ -1742,6 +1745,10 @@ pub const FetchOptions = struct {
     /// Externally-owned; must outlive the Request.
     privileged_headers: []const http.Header = &.{},
 
+    retry_attempts: usize = 0, // Number of retries to perform on failure.
+    retry_delay: f32 = 500, // Initial time in milliseconds before first retry.
+    retry_exponential_backoff_base: f32 = 2, // Base for exponential backoff.
+
     pub const Location = union(enum) {
         url: []const u8,
         uri: Uri,
@@ -1757,12 +1764,47 @@ pub const FetchOptions = struct {
 
 pub const FetchResult = struct {
     status: http.Status,
+    retry_count: usize = 0, // Number of retries performed.
+    retry_status: ?http.Status = null, // Status of the last failed retry that received a response, if any.
+    retry_error: ?anyerror = null, // Error of the last retry with an error, if any.
 };
 
-/// Perform a one-shot HTTP request with the provided options.
+pub const FutureFetchResult = Future(FetchResult, anyerror);
+
+/// Perform an HTTP request with the provided options.
 ///
 /// This function is threadsafe.
-pub fn fetch(client: *Client, rt: *tardy.Runtime, options: FetchOptions) !FetchResult {
+pub fn fetch(client: *Client, rt: *tardy.Runtime, future: *FutureFetchResult, options: FetchOptions) !void {
+    return try rt.spawn(.{ rt, client, future, options }, fetchFrame, FETCH_STACK_SIZE);
+}
+
+fn fetchFrame(rt: *tardy.Runtime, client: *Client, future: *FutureFetchResult, options: FetchOptions) !void {
+    var result: FetchResult = .{ .status = undefined };
+    for (0..options.retry_attempts + 1) |i| {
+        if (fetchInternal(client, rt, options)) |status| {
+            if (status.class() == .success or i == options.retry_attempts) {
+                result.status = status;
+                try future.setResult(result);
+                return;
+            }
+            result.retry_status = status;
+            result.retry_count += 1;
+        } else |err| {
+            if (i == options.retry_attempts) {
+                try future.setError(err);
+                return;
+            }
+            result.retry_count += 1;
+            result.retry_error = err;
+        }
+        // Add some randomness to backoff delay to spread out concurrent retries.
+        const base_time: f32 = std.crypto.random.float(f32) * options.retry_delay * 0.5 + options.retry_delay;
+        const backoff_time: f32 = base_time * std.math.pow(f32, options.retry_exponential_backoff_base, @floatFromInt(i));
+        try tardy.Timer.delay(rt, .{ .nanos = @intFromFloat(backoff_time * std.time.ns_per_ms) });
+    }
+}
+
+fn fetchInternal(client: *Client, rt: *tardy.Runtime, options: FetchOptions) !http.Status {
     const uri = switch (options.location) {
         .url => |u| try Uri.parse(u),
         .uri => |u| u,
@@ -1815,9 +1857,7 @@ pub fn fetch(client: *Client, rt: *tardy.Runtime, options: FetchOptions) !FetchR
         },
     }
 
-    return .{
-        .status = req.response.status,
-    };
+    return req.response.status;
 }
 
 test {

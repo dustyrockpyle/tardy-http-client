@@ -39,7 +39,9 @@ exe_mod.addImport("tardy_http_client", tardy_http_client);
 zig build run_multi_fetch
 ```
 
-Check out `examples/multi_fetch.zig`. tardy-http-client has the same API as std.http.Client except with an additional `tardy.Runtime*` argument in certain places. It will only work properly in a tardy runtime.
+Check out `examples/multi_fetch.zig`. tardy-http-client has nearly the same API as std.http.Client.
+Client.fetch has two extra arguments; `tardy.Runtime*` and `Client.Future`, and FetchOptions has some additional arguments for bonus retry logic.
+The HTTP Client will not work without running in a tardy runtime.
 
 ## Notes
 
