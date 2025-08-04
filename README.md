@@ -33,20 +33,65 @@ exe_mod.addImport("tardy", tardy);
 exe_mod.addImport("tardy_http_client", tardy_http_client);
 ```
 
-## Usage
+## Example Usage
 
 ```sh
+zig build run_basic -- https://google.com
 zig build run_multi_fetch
 ```
 
-Check out `examples/multi_fetch.zig`. tardy-http-client has nearly the same API as std.http.Client.
-Client.fetch has two extra arguments; `tardy.Runtime*` and `Client.Future`, and FetchOptions has some additional arguments for bonus retry logic.
-The HTTP Client will not work without running in a tardy runtime.
+- tardy-http-client has nearly the same API as std.http.Client.
+- Client.fetch has two extra arguments; `*tardy.Runtime` and `*Client.FutureFetchResult`
+- `Client.FetchOptions` has some bonus arguments for retry logic.
+- The HTTP Client must be running in a tardy runtime to function.
+
+Minimal one-shot HTTP Request example:
+
+```zig
+const std = @import("std");
+const Tardy = @import("tardy").Tardy(.auto);
+const Runtime = @import("tardy").Runtime;
+const Client = @import("tardy_http_client");
+pub const std_options: std.Options = .{ .log_level = .warn };
+
+const Context = struct {
+    allocator: std.mem.Allocator,
+};
+
+// Queries https://api.ipify.org/ and prints the result.
+fn main_frame(rt: *Runtime, context: *Context) !void {
+    var client: Client = .{ .allocator = context.allocator };
+    defer client.deinit();
+    var response: std.ArrayList(u8) = .init(context.allocator);
+    defer response.deinit();
+    var future: Client.FutureFetchResult = .{};
+
+    try client.fetch(rt, &future, .{
+        .location = .{ .url = "https://api.ipify.org" },
+        .response_storage = .{ .dynamic = &response },
+    });
+
+    const result = try future.result(rt);
+    std.debug.print("Status: {} - {?s}\n", .{ @intFromEnum(result.status), result.status.phrase() });
+    std.debug.print("Body: {s}\n", .{response.items});
+}
+
+const FRAME_SIZE = 1024 * 32; // Max size of the main_frame stack.
+fn start(rt: *Runtime, c: *Context) !void {
+    try rt.spawn(.{ rt, c }, main_frame, FRAME_SIZE);
+}
+
+pub fn main() !void {
+    const gpa = std.heap.smp_allocator;
+    var context = Context{ .allocator = gpa };
+    var tardy = try Tardy.init(gpa, .{ .threading = .single });
+    defer tardy.deinit();
+    try tardy.entry(&context, start);
+}
+```
 
 ## Notes
 
-Tested only on an arm64 Mac, and only on a few URLS.
-
-Each HTTP Request coroutine requires 2MiB of stack space (for HTTPS requests, ~512KiB for HTTP). It will crash if you provide less. It might crash on URLs I haven't tested (i.e, almost all of them).
-
-If you use this in prod you deserve jailtime (but I'm going to anyway)
+- Tested only on an arm64 Mac, and only on a few URLS. It should have the same limitations as std.http.Client.
+- Each HTTP Request coroutine requires 2MiB of stack space. It will crash if you provide less.
+- If you use this in prod you deserve jailtime (but I'm going to anyway)
