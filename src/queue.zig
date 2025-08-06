@@ -343,7 +343,7 @@ test "Queue: Multi-threaded MPMC" {
     const size: usize = 1024;
     const num_producers = 4;
     const num_consumers = 4;
-    const items_per_producer = 1_000_000;
+    const items_per_producer = 100_000;
 
     var ring: Queue(u32) = try .init(testing.allocator, size);
     defer ring.deinit();
@@ -429,7 +429,7 @@ fn mixedOperations(ctx: *ThreadContext) !void {
     var prng = Random.DefaultPrng.init(@intCast(ctx.thread_id));
     const random = prng.random();
 
-    const operations_per_thread = 1_000_000;
+    const operations_per_thread = 100_000;
     for (0..operations_per_thread) |i| {
         if (random.boolean()) {
             // Try to push

@@ -137,3 +137,267 @@ pub fn FutureResult(comptime T: type, comptime E: type) type {
         }
     };
 }
+
+const testing = std.testing;
+const Tardy = @import("tardy").Tardy(.auto);
+const Timer = @import("tardy").Timer;
+
+test "Future: Basic init and state" {
+    var future = Future(u32, anyerror){};
+
+    // Initial state should be pending
+    try testing.expect(!future.done());
+    try testing.expect(!future.cancelled());
+    try testing.expectEqual(FutureState.pending, future.state.load(.acquire));
+}
+
+test "Future: Set result and retrieve" {
+    var future = Future(u32, anyerror){};
+
+    // Set a result
+    try future.setResult(42);
+
+    // Future should be done
+    try testing.expect(future.done());
+    try testing.expect(!future.cancelled());
+
+    // Should not be able to set again
+    try testing.expectError(error.AlreadySet, future.setResult(43));
+    try testing.expectError(error.AlreadySet, future.setError(error.TestError));
+    try testing.expectError(error.AlreadySet, future.setCancelled());
+}
+
+test "Future: Set error and retrieve" {
+    var future = Future(u32, anyerror){};
+
+    // Set an error
+    try future.setError(error.TestError);
+
+    // Future should be done
+    try testing.expect(future.done());
+    try testing.expect(!future.cancelled());
+
+    // Should not be able to set again
+    try testing.expectError(error.AlreadySet, future.setResult(42));
+    try testing.expectError(error.AlreadySet, future.setError(error.AnotherError));
+}
+
+test "Future: Cancel" {
+    var future = Future(u32, anyerror){};
+
+    // Cancel the future
+    try future.setCancelled();
+
+    // Future should be cancelled
+    try testing.expect(future.done());
+    try testing.expect(future.cancelled());
+
+    // Should not be able to set after cancellation
+    try testing.expectError(error.FutureCancelled, future.setResult(42));
+    try testing.expectError(error.FutureCancelled, future.setError(error.TestError));
+    try testing.expectError(error.FutureCancelled, future.setCancelled());
+}
+
+test "Future: Basic async result" {
+    var tardy = try Tardy.init(testing.allocator, .{ .threading = .single });
+    defer tardy.deinit();
+
+    const Context = struct {
+        future: Future(u32, anyerror) = .{},
+        result: ?u32 = null,
+        err: ?anyerror = null,
+        producer_done: Atomic(bool) = .{ .raw = false },
+        consumer_done: Atomic(bool) = .{ .raw = false },
+    };
+
+    var ctx = Context{};
+
+    try tardy.entry(&ctx, struct {
+        fn start(rt: *Runtime, c: *Context) !void {
+            try rt.spawn(.{ rt, c }, consumer, 1024 * 16);
+            try rt.spawn(.{ rt, c }, producer, 1024 * 16);
+        }
+
+        fn producer(rt: *Runtime, c: *Context) !void {
+            // Small delay to ensure consumer is waiting
+            try Timer.delay(rt, .{ .nanos = std.time.ns_per_ms * 10 });
+            try c.future.setResult(42);
+            c.producer_done.store(true, .release);
+        }
+
+        fn consumer(rt: *Runtime, c: *Context) !void {
+            c.result = c.future.result(rt) catch |err| {
+                c.err = err;
+                c.consumer_done.store(true, .release);
+                return;
+            };
+            c.consumer_done.store(true, .release);
+        }
+    }.start);
+
+    try testing.expect(ctx.producer_done.load(.acquire));
+    try testing.expect(ctx.consumer_done.load(.acquire));
+    try testing.expectEqual(@as(?u32, 42), ctx.result);
+    try testing.expectEqual(@as(?anyerror, null), ctx.err);
+}
+
+test "Future: Async error propagation" {
+    var tardy = try Tardy.init(testing.allocator, .{ .threading = .single });
+    defer tardy.deinit();
+
+    const Context = struct {
+        future: Future(u32, anyerror) = .{},
+        result: ?u32 = null,
+        err: ?anyerror = null,
+        done: Atomic(bool) = .{ .raw = false },
+    };
+
+    var ctx = Context{};
+
+    try tardy.entry(&ctx, struct {
+        fn start(rt: *Runtime, c: *Context) !void {
+            try rt.spawn(.{ rt, c }, consumer, 1024 * 16);
+            try rt.spawn(.{ rt, c }, producer, 1024 * 16);
+        }
+
+        fn producer(rt: *Runtime, c: *Context) !void {
+            // Small delay to ensure consumer is waiting
+            try Timer.delay(rt, .{ .nanos = std.time.ns_per_ms * 10 });
+            try c.future.setError(error.TestError);
+        }
+
+        fn consumer(rt: *Runtime, c: *Context) !void {
+            c.result = c.future.result(rt) catch |err| {
+                c.err = err;
+                c.done.store(true, .release);
+                return;
+            };
+            c.done.store(true, .release);
+        }
+    }.start);
+
+    try testing.expect(ctx.done.load(.acquire));
+    try testing.expectEqual(@as(?u32, null), ctx.result);
+    try testing.expectEqual(@as(?anyerror, error.TestError), ctx.err);
+}
+
+test "Future: Async cancellation" {
+    var tardy = try Tardy.init(testing.allocator, .{ .threading = .single });
+    defer tardy.deinit();
+
+    const Context = struct {
+        future: Future(u32, anyerror) = .{},
+        result: ?u32 = null,
+        err: ?anyerror = null,
+        done: Atomic(bool) = .{ .raw = false },
+    };
+
+    var ctx = Context{};
+
+    try tardy.entry(&ctx, struct {
+        fn start(rt: *Runtime, c: *Context) !void {
+            try rt.spawn(.{ rt, c }, consumer, 1024 * 16);
+            try rt.spawn(.{ rt, c }, canceller, 1024 * 16);
+        }
+
+        fn canceller(rt: *Runtime, c: *Context) !void {
+            // Small delay to ensure consumer is waiting
+            try Timer.delay(rt, .{ .nanos = std.time.ns_per_ms * 10 });
+            try c.future.setCancelled();
+        }
+
+        fn consumer(rt: *Runtime, c: *Context) !void {
+            c.result = c.future.result(rt) catch |err| {
+                c.err = err;
+                c.done.store(true, .release);
+                return;
+            };
+            c.done.store(true, .release);
+        }
+    }.start);
+
+    try testing.expect(ctx.done.load(.acquire));
+    try testing.expectEqual(@as(?u32, null), ctx.result);
+    try testing.expectEqual(@as(?anyerror, error.FutureCancelled), ctx.err);
+}
+
+test "Future: init_with_notify" {
+    var tardy = try Tardy.init(testing.allocator, .{ .threading = .single });
+    defer tardy.deinit();
+
+    const Context = struct {
+        result: ?u32 = null,
+        err: ?anyerror = null,
+        done: Atomic(bool) = .{ .raw = false },
+    };
+
+    var ctx = Context{};
+
+    try tardy.entry(&ctx, struct {
+        fn start(rt: *Runtime, c: *Context) !void {
+            try rt.spawn(.{ rt, c }, worker, 1024 * 16);
+        }
+
+        fn worker(rt: *Runtime, c: *Context) !void {
+            // Create a future that will notify this task
+            var future = Future(u32, anyerror).init_with_notify(rt);
+
+            // Spawn a producer that will set the result
+            try rt.spawn(.{ rt, &future }, producer, 1024 * 16);
+
+            // Yield - we should be awoken when the result is set.
+            try rt.scheduler.trigger_await();
+
+            c.result = future.result(rt) catch |err| {
+                c.err = err;
+                c.done.store(true, .release);
+                return;
+            };
+            c.done.store(true, .release);
+        }
+
+        fn producer(rt: *Runtime, future: *Future(u32, anyerror)) !void {
+            // Small delay to ensure worker is waiting
+            try Timer.delay(rt, .{ .nanos = std.time.ns_per_ms * 10 });
+            try future.setResult(123);
+        }
+    }.start);
+
+    try testing.expect(ctx.done.load(.acquire));
+    try testing.expectEqual(@as(?u32, 123), ctx.result);
+    try testing.expectEqual(@as(?anyerror, null), ctx.err);
+}
+
+test "Future: Result retrieval after set" {
+    var tardy = try Tardy.init(testing.allocator, .{ .threading = .single });
+    defer tardy.deinit();
+
+    const Context = struct {
+        future: Future(u32, anyerror) = .{},
+        results: [3]?u32 = [_]?u32{null} ** 3,
+    };
+
+    var ctx = Context{};
+
+    try tardy.entry(&ctx, struct {
+        fn start(rt: *Runtime, c: *Context) !void {
+            // Set the result first
+            try c.future.setResult(999);
+
+            // Now spawn multiple consumers to read it
+            try rt.spawn(.{ rt, c, 0 }, consumer, 1024 * 16);
+            try rt.spawn(.{ rt, c, 1 }, consumer, 1024 * 16);
+            try rt.spawn(.{ rt, c, 2 }, consumer, 1024 * 16);
+        }
+
+        fn consumer(rt: *Runtime, c: *Context, idx: usize) !void {
+            // All should get the result immediately since it's already set
+            c.results[idx] = try c.future.result(rt);
+        }
+    }.start);
+
+    // All consumers should have gotten the same result
+    for (ctx.results) |result| {
+        try testing.expectEqual(@as(?u32, 999), result);
+    }
+}
