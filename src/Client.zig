@@ -19,10 +19,11 @@ const proto = std.http.protocol;
 
 pub const disable_tls = std.options.http_disable_tls;
 pub const tardy = @import("tardy");
-pub const Stream = @import("Stream.zig");
-pub const Future = @import("future.zig").Future;
+pub const Stream = @import("./Stream.zig");
+pub const Future = @import("./future.zig").Future;
+pub const AsyncQueue = @import("./async_queue.zig").AsyncQueue;
 
-const FETCH_STACK_SIZE: usize = 2 << 20; // 2 MiB stack size for each client task (seems like a lot, but 1 MiB crashes for HTTPS endpoints...).
+pub const FETCH_STACK_SIZE: usize = 2 << 20; // 2 MiB stack size for each client task (seems like a lot, but 1 MiB crashes for HTTPS endpoints...).
 
 /// Used for all client allocations. Must be thread-safe.
 allocator: Allocator,
@@ -1771,6 +1772,39 @@ pub const FetchResult = struct {
 
 pub const FutureFetchResult = Future(FetchResult, anyerror);
 
+pub const FetchTask = struct {
+    options: *FetchOptions,
+};
+
+pub const FetchTaskResult = struct {
+    task: FetchTask,
+    result: anyerror!FetchResult,
+
+    pub fn deinit(self: *FetchTaskResult, alloc: std.mem.Allocator) void {
+        // TODO: Find a better way to handle this. Maybe should enforce an arena passed into FetchOptions, let the
+        // user pick what goes into the arena (and they manually manage everything else), and then deinit only the arena here.
+        const options = self.task.options;
+        switch (options.location) {
+            .url => |url| alloc.free(url),
+            .uri => {},
+        }
+        switch (options.response_storage) {
+            .dynamic => |list| {
+                list.deinit();
+                alloc.destroy(list);
+            },
+            .static => |list| {
+                alloc.destroy(list);
+            },
+            .ignore => {},
+        }
+        alloc.destroy(options);
+    }
+};
+
+pub const FetchTaskQueue = AsyncQueue(FetchTask);
+pub const FetchResultQueue = AsyncQueue(FetchTaskResult);
+
 /// Perform an HTTP request with the provided options.
 ///
 /// This function is threadsafe.
@@ -1778,24 +1812,44 @@ pub fn fetch(client: *Client, rt: *tardy.Runtime, future: *FutureFetchResult, op
     return try rt.spawn(.{ rt, client, future, options }, fetchFrame, FETCH_STACK_SIZE);
 }
 
+pub fn spawnFetchWorker(client: *Client, rt: *tardy.Runtime, task_queue: *FetchTaskQueue, completion_queue: *FetchResultQueue) !void {
+    return try rt.spawn(.{ rt, client, task_queue, completion_queue }, fetchWorkerFrame, FETCH_STACK_SIZE);
+}
+
 fn fetchFrame(rt: *tardy.Runtime, client: *Client, future: *FutureFetchResult, options: FetchOptions) !void {
+    if (fetchWithRetries(client, rt, options)) |result| {
+        future.setResult(result) catch {};
+    } else |err| {
+        future.setError(err) catch {};
+    }
+}
+
+fn fetchWorkerFrame(rt: *tardy.Runtime, client: *Client, task_queue: *FetchTaskQueue, completion_queue: *FetchResultQueue) !void {
+    while (true) {
+        const task = task_queue.pop(rt) catch |err| switch (err) {
+            error.Shutdown => return,
+            else => |e| return e,
+        };
+        const result: FetchTaskResult = .{ .task = task, .result = fetchWithRetries(client, rt, task.options.*) };
+        try completion_queue.push(rt, result);
+    }
+}
+
+fn fetchWithRetries(client: *Client, rt: *tardy.Runtime, options: FetchOptions) !FetchResult {
     var result: FetchResult = .{ .status = undefined };
-    for (0..options.retry_attempts + 1) |i| {
+    var i: usize = 0;
+    while (true) : (i += 1) {
         if (fetchInternal(client, rt, options)) |status| {
             if (status.class() == .success or i == options.retry_attempts) {
                 result.status = status;
-                try future.setResult(result);
-                return;
+                return result;
             }
             result.retry_status = status;
             result.retry_count += 1;
         } else |err| {
-            if (i == options.retry_attempts) {
-                try future.setError(err);
-                return;
-            }
-            result.retry_count += 1;
+            if (i == options.retry_attempts) return err;
             result.retry_error = err;
+            result.retry_count += 1;
         }
         // Add some randomness to backoff delay to spread out concurrent retries.
         const base_time: f32 = std.crypto.random.float(f32) * options.retry_delay * 0.5 + options.retry_delay;

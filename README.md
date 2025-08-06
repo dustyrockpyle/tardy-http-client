@@ -38,11 +38,13 @@ exe_mod.addImport("tardy_http_client", tardy_http_client);
 ```sh
 zig build run_basic -- https://google.com
 zig build run_multi_fetch
+zig build run_url_scraper > urls.txt
 ```
 
 - tardy-http-client has nearly the same API as std.http.Client.
 - Client.fetch has two extra arguments; `*tardy.Runtime` and `*Client.FutureFetchResult`
 - `Client.FetchOptions` has some bonus arguments for retry logic.
+- The `Client.fetchWorkerFrame` API creates a worker that consumes a `FetchTask` queue and produces a `FetchTaskResult` queue.
 - The HTTP Client must be running in a tardy runtime to function.
 
 Minimal one-shot HTTP Request example:

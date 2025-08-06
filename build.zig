@@ -17,8 +17,9 @@ pub fn build(b: *std.Build) void {
 
     thc.addImport("tardy", tardy);
 
-    add_example(b, "multi_fetch", target, optimize, thc);
     add_example(b, "basic", target, optimize, thc);
+    add_example(b, "multi_fetch", target, optimize, thc);
+    add_example(b, "url_scraper", target, optimize, thc);
 
     const test_runner = std.Build.Step.Compile.TestRunner{ .path = b.path("test_runner.zig"), .mode = .simple };
     const tests = b.addTest(.{
