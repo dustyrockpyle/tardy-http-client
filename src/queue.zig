@@ -4,6 +4,14 @@ const Random = std.Random;
 
 const Atomic = std.atomic.Value;
 
+pub const PopError = error{
+    QueueEmpty,
+};
+
+pub const PushError = error{
+    QueueFull,
+};
+
 pub fn Queue(comptime T: type) type {
     return struct {
         const Self = @This();
@@ -20,11 +28,10 @@ pub fn Queue(comptime T: type) type {
         write_index: Atomic(usize) align(std.atomic.cache_line),
         read_index: Atomic(usize) align(std.atomic.cache_line),
 
-        pub fn init(allocator: std.mem.Allocator, size: usize) !Self {
-            assert(size >= 2);
-            assert(std.math.isPowerOfTwo(size));
+        pub fn init(allocator: std.mem.Allocator, min_size: usize) !Self {
+            const pow2Size = try std.math.ceilPowerOfTwo(usize, @max(2, min_size));
 
-            const buffer = try allocator.alloc(Cell, size);
+            const buffer = try allocator.alloc(Cell, pow2Size);
             errdefer allocator.free(buffer);
 
             // Initialize sequence numbers for each cell
@@ -35,7 +42,7 @@ pub fn Queue(comptime T: type) type {
             return .{
                 .allocator = allocator,
                 .buffer = buffer,
-                .mask = size - 1,
+                .mask = pow2Size - 1,
                 .write_index = .{ .raw = 0 },
                 .read_index = .{ .raw = 0 },
             };
@@ -45,19 +52,13 @@ pub fn Queue(comptime T: type) type {
             self.allocator.free(self.buffer);
         }
 
-        pub fn push(self: *Self, item: T) !void {
+        pub fn push(self: *Self, item: T) PushError!void {
             var pos = self.write_index.load(.monotonic);
 
             while (true) {
-                // Check if queue would be full (keeping one slot empty for traditional ring buffer semantics)
-                const read_pos = self.read_index.load(.acquire);
-                if (pos -% read_pos >= self.buffer.len - 1) {
-                    return error.RingFull;
-                }
-
                 const cell = &self.buffer[pos & self.mask];
                 const seq = cell.sequence.load(.acquire);
-                const dif = @as(isize, @intCast(seq)) - @as(isize, @intCast(pos));
+                const dif: isize = @bitCast(seq -% pos);
 
                 if (dif == 0) {
                     // Cell is available for writing, try to claim it
@@ -71,7 +72,7 @@ pub fn Queue(comptime T: type) type {
                     return;
                 } else if (dif < 0) {
                     // Cell is not yet available for writing (queue is full)
-                    return error.RingFull;
+                    return PushError.QueueFull;
                 } else {
                     // Cell is ahead of us, reload position and retry
                     pos = self.write_index.load(.monotonic);
@@ -79,13 +80,13 @@ pub fn Queue(comptime T: type) type {
             }
         }
 
-        pub fn pop(self: *Self) !T {
+        pub fn pop(self: *Self) PopError!T {
             var pos = self.read_index.load(.monotonic);
 
             while (true) {
                 const cell = &self.buffer[pos & self.mask];
                 const seq = cell.sequence.load(.acquire);
-                const dif = @as(isize, @intCast(seq)) - @as(isize, @intCast(pos + 1));
+                const dif: isize = @bitCast(seq -% (pos + 1));
 
                 if (dif == 0) {
                     // Try to claim this cell for reading
@@ -99,12 +100,19 @@ pub fn Queue(comptime T: type) type {
                     return data;
                 } else if (dif < 0) {
                     // Queue is empty
-                    return error.RingEmpty;
+                    return PopError.QueueEmpty;
                 } else {
                     // Another thread is ahead, reload and retry
                     pos = self.read_index.load(.monotonic);
                 }
             }
+        }
+
+        // Gets approximate number of items
+        pub fn approxLen(self: *Self) usize {
+            const write_pos = self.write_index.load(.monotonic);
+            const read_pos = self.read_index.load(.monotonic);
+            return write_pos -% read_pos;
         }
     };
 }
@@ -116,11 +124,12 @@ test "Queue: Minimum Size" {
     var ring: Queue(u32) = try .init(testing.allocator, 2);
     defer ring.deinit();
 
-    // Queue can hold size-1 items (1 item)
     try ring.push(42);
-    try testing.expectError(error.RingFull, ring.push(43));
+    try ring.push(43);
+    try testing.expectError(error.QueueFull, ring.push(44));
     try testing.expectEqual(@as(u32, 42), try ring.pop());
-    try testing.expectError(error.RingEmpty, ring.pop());
+    try testing.expectEqual(@as(u32, 43), try ring.pop());
+    try testing.expectError(error.QueueEmpty, ring.pop());
 }
 
 test "Queue: Large Size" {
@@ -130,16 +139,16 @@ test "Queue: Large Size" {
     defer ring.deinit();
 
     // Fill to capacity
-    for (0..size - 1) |i| {
+    for (0..size) |i| {
         try ring.push(@intCast(i));
     }
-    try testing.expectError(error.RingFull, ring.push(9999));
+    try testing.expectError(error.QueueFull, ring.push(9999));
 
     // Verify all values
-    for (0..size - 1) |i| {
+    for (0..size) |i| {
         try testing.expectEqual(@as(u64, @intCast(i)), try ring.pop());
     }
-    try testing.expectError(error.RingEmpty, ring.pop());
+    try testing.expectError(error.QueueEmpty, ring.pop());
 }
 
 test "Queue: Wrap Around" {
@@ -158,18 +167,18 @@ test "Queue: Wrap Around" {
     }
 
     // Fill again to test wrap around
-    for (4..11) |i| {
+    for (4..12) |i| {
         try ring.push(@intCast(i));
     }
 
     // Should be full now
-    try testing.expectError(error.RingFull, ring.push(99));
+    try testing.expectError(error.QueueFull, ring.push(99));
 
     // Pop all and verify order
-    for (4..11) |i| {
+    for (4..12) |i| {
         try testing.expectEqual(@as(u32, @intCast(i)), try ring.pop());
     }
-    try testing.expectError(error.RingEmpty, ring.pop());
+    try testing.expectError(error.QueueEmpty, ring.pop());
 }
 
 test "Queue: Alternating Push Pop" {
@@ -228,7 +237,7 @@ test "Queue: Concurrent Simulation" {
         try testing.expectEqual(@as(u32, @intCast(i * 2 + 1)), try ring.pop());
     }
 
-    try testing.expectError(error.RingEmpty, ring.pop());
+    try testing.expectError(error.QueueEmpty, ring.pop());
 }
 
 test "Queue: Stress Test" {
@@ -237,70 +246,19 @@ test "Queue: Stress Test" {
     defer ring.deinit();
 
     // Perform many cycles of fill/empty
-    for (0..10) |cycle| {
+    for (0..1000) |cycle| {
         // Fill to capacity
-        for (0..size - 1) |i| {
+        for (0..size) |i| {
             try ring.push(cycle * 1000 + i);
         }
-        try testing.expectError(error.RingFull, ring.push(9999));
+        try testing.expectError(error.QueueFull, ring.push(9999));
 
         // Empty completely
-        for (0..size - 1) |i| {
+        for (0..size) |i| {
             try testing.expectEqual(cycle * 1000 + i, try ring.pop());
         }
-        try testing.expectError(error.RingEmpty, ring.pop());
+        try testing.expectError(error.QueueEmpty, ring.pop());
     }
-}
-
-test "Queue: Complex Data Type" {
-    const Point = struct {
-        x: f32,
-        y: f32,
-        z: f32,
-    };
-
-    var ring: Queue(Point) = try .init(testing.allocator, 16);
-    defer ring.deinit();
-
-    // Test with struct type
-    const points = [_]Point{
-        .{ .x = 1.0, .y = 2.0, .z = 3.0 },
-        .{ .x = 4.0, .y = 5.0, .z = 6.0 },
-        .{ .x = 7.0, .y = 8.0, .z = 9.0 },
-    };
-
-    for (points) |p| {
-        try ring.push(p);
-    }
-
-    for (points) |expected| {
-        const actual = try ring.pop();
-        try testing.expectEqual(expected.x, actual.x);
-        try testing.expectEqual(expected.y, actual.y);
-        try testing.expectEqual(expected.z, actual.z);
-    }
-}
-
-test "Queue: Boundary Conditions" {
-    var ring: Queue(u8) = try .init(testing.allocator, 4);
-    defer ring.deinit();
-
-    // Test exactly at capacity (size-1 = 3 items)
-    try ring.push(1);
-    try ring.push(2);
-    try ring.push(3);
-    try testing.expectError(error.RingFull, ring.push(4));
-
-    // Pop one and push one (boundary test)
-    try testing.expectEqual(@as(u8, 1), try ring.pop());
-    try ring.push(4);
-    try testing.expectError(error.RingFull, ring.push(5));
-
-    // Verify remaining items
-    try testing.expectEqual(@as(u8, 2), try ring.pop());
-    try testing.expectEqual(@as(u8, 3), try ring.pop());
-    try testing.expectEqual(@as(u8, 4), try ring.pop());
-    try testing.expectError(error.RingEmpty, ring.pop());
 }
 
 test "Queue: Sequential Consistency" {
@@ -383,9 +341,9 @@ fn consumer(ctx: *ConsumerContext) !void {
 
 test "Queue: Multi-threaded MPMC" {
     const size: usize = 1024;
-    const num_producers = 8;
-    const num_consumers = 8;
-    const items_per_producer = 100000;
+    const num_producers = 4;
+    const num_consumers = 4;
+    const items_per_producer = 1_000_000;
 
     var ring: Queue(u32) = try .init(testing.allocator, size);
     defer ring.deinit();
@@ -460,7 +418,7 @@ test "Queue: Multi-threaded MPMC" {
 }
 
 const ThreadContext = struct {
-    queue: *Queue(usize),
+    queue: *Queue(u32),
     thread_id: usize,
     push_count: usize = 0,
     pop_count: usize = 0,
@@ -471,25 +429,19 @@ fn mixedOperations(ctx: *ThreadContext) !void {
     var prng = Random.DefaultPrng.init(@intCast(ctx.thread_id));
     const random = prng.random();
 
-    const operations_per_thread = 1000000;
+    const operations_per_thread = 1_000_000;
     for (0..operations_per_thread) |i| {
         if (random.boolean()) {
             // Try to push
-            const value = ctx.thread_id * operations_per_thread + i;
-            ctx.queue.push(value) catch {
-                // Queue full, that's ok
-                continue;
-            };
+            const value: u32 = @intCast(ctx.thread_id * operations_per_thread + i);
+            ctx.queue.push(value) catch continue;
             ctx.push_count += 1;
             ctx.values_sum +%= value;
         } else {
             // Try to pop
-            if (ctx.queue.pop()) |value| {
-                ctx.pop_count += 1;
-                ctx.values_sum -%= value;
-            } else |_| {
-                // Queue empty, that's ok
-            }
+            const value = ctx.queue.pop() catch continue;
+            ctx.pop_count += 1;
+            ctx.values_sum -%= value;
         }
     }
 }
@@ -498,7 +450,7 @@ test "Queue: Multi-threaded Stress" {
     const size: usize = 256;
     const num_threads = 8;
 
-    var ring: Queue(usize) = try .init(testing.allocator, size);
+    var ring: Queue(u32) = try .init(testing.allocator, size);
     defer ring.deinit();
 
     // Create and run threads

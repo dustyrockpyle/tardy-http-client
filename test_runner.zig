@@ -11,6 +11,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
+pub const std_options: std.Options = .{ .log_level = .warn };
+
 const BORDER = "=" ** 80;
 
 const Status = enum {
