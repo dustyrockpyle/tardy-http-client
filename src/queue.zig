@@ -17,7 +17,7 @@ pub fn Queue(comptime T: type) type {
         const Self = @This();
 
         const Cell = struct {
-            sequence: Atomic(usize) align(std.atomic.cache_line),
+            sequence: Atomic(usize),
             data: T,
         };
 
